@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import datetime
+import os
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Zaawansowany MACD Bot", layout="wide")
@@ -40,8 +41,48 @@ def sell(cena, saldo, amount, procent_akcji):
 # --- INTERFEJS UŻYTKOWNIKA (Pasek boczny) ---
 st.sidebar.title("⚙️ Zaawansowany Panel")
 
-st.sidebar.header("1. Spółka i Kapitał")
-ticker_symbol = st.sidebar.text_input("Ticker Yahoo Finance (np. PKN.WA, DNP.WA, AAPL):", "PKN.WA")
+# --- ZNAJDŹ TEN FRAGMENT I PODMIEŃ W CAŁOŚCI ---
+st.sidebar.header("1. Twoje Spółki i Kapitał")
+
+# Nazwa pliku na serwerze, w którym trzymamy listę
+WATCHLIST_FILE = "watchlist.txt"
+DEFAULT_TICKERS = "PKN.WA, DNP.WA, PKO.WA, KGH.WA, XTB.WA, AAPL, TSLA"
+
+# Funkcja wczytująca listę z pliku
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        with open(WATCHLIST_FILE, "r") as f:
+            return f.read().strip()
+    return DEFAULT_TICKERS
+
+# Wczytujemy aktualną listę do pamięci sesji
+if 'current_watchlist' not in st.session_state:
+    st.session_state['current_watchlist'] = load_watchlist()
+
+# Pole tekstowe do edycji (wczytuje dane z sesji/pliku)
+watchlist_input = st.sidebar.text_area(
+    "📝 Lista obserwowanych (oddzielaj przecinkiem):",
+    value=st.session_state['current_watchlist']
+)
+
+# Przycisk, który nadpisuje plik na serwerze nowymi danymi
+if st.sidebar.button("💾 Zapisz listę na stałe"):
+    with open(WATCHLIST_FILE, "w") as f:
+        f.write(watchlist_input)
+    st.session_state['current_watchlist'] = watchlist_input
+    st.sidebar.success("Pomyślnie zapisano na serwerze!")
+
+# Przetworzenie tekstu na listę do dropdowna
+watchlist = [ticker.strip().upper() for ticker in watchlist_input.split(",") if ticker.strip()]
+
+# Zabezpieczenie na wypadek pustego pola
+if not watchlist:
+    watchlist = ["PKN.WA"]
+
+# Rozwijana lista (Dropdown)
+ticker_symbol = st.sidebar.selectbox("🎯 Wybierz spółkę do analizy:", options=watchlist)
+
+# Suwak kapitału
 saldo_poczatkowe = st.sidebar.number_input("Kapitał początkowy (zł):", value=1000.0, step=500.0, min_value=100.0)
 wielkosc_doplaty = st.sidebar.number_input("Wpłata miesięczna (zł):", value=500.0, step=50.0, min_value=100.0)
 
@@ -74,6 +115,75 @@ if start_date >= end_date:
 
 # --- GŁÓWNA CZĘŚĆ APLIKACJI ---
 st.title(f"📈 Analiza strategii dla: {ticker_symbol}")
+
+st.subheader("📋 Skaner Rynkowy (Twoja Lista Obserwowanych)")
+
+# Używamy spinnera, bo pobranie kilku spółek zajmie 2-3 sekundy
+with st.spinner("Skanowanie rynku dla obserwowanych spółek..."):
+    summary_data = []
+
+    # Przechodzimy pętlą przez każdą spółkę z Twojej listy 'watchlist'
+    for t in watchlist:
+        try:
+            # Pobieramy tylko ostatnie 3 miesiące - to wystarczy by policzyć dzisiejszy MACD
+            hist = yf.Ticker(t).history(period="3mo")
+            if hist.empty:
+                continue
+
+            ceny_w = hist['Close']
+
+            # Liczymy MACD dla danej spółki
+            shortEMA_w = ceny_w.ewm(span=short_span).mean()
+            longEMA_w = ceny_w.ewm(span=long_span).mean()
+            MACD_w = shortEMA_w - longEMA_w
+            signal_w = MACD_w.ewm(span=signal_span).mean()
+
+            dzis_m = MACD_w.iloc[-1]
+            dzis_s = signal_w.iloc[-1]
+            wczoraj_m = MACD_w.iloc[-2]
+            wczoraj_s = signal_w.iloc[-2]
+            ost_cena = ceny_w.iloc[-1]
+
+            # Ustalamy sygnał (taka sama logika jak w głównej analizie)
+            sygnal_text = "CZEKAJ"
+            kolor = "⚪"
+
+            if dzis_m > dzis_s and wczoraj_m <= wczoraj_s:
+                if dzis_m <= poziom_dolka:
+                    sygnal_text = "MOCNE KUPUJ"
+                    kolor = "🟩"
+                else:
+                    sygnal_text = "KUPUJ"
+                    kolor = "🟢"
+            elif dzis_m < dzis_s and wczoraj_m >= wczoraj_s:
+                if dzis_m >= poziom_gorki:
+                    sygnal_text = "MOCNE SPRZEDAJ"
+                    kolor = "🟥"
+                else:
+                    sygnal_text = "SPRZEDAJ"
+                    kolor = "🟠"
+
+            summary_data.append({
+                "Spółka": t,
+                "Kurs": f"{ost_cena:.2f}",
+                "MACD": round(dzis_m, 2),
+                "Signal": round(dzis_s, 2),
+                "Status": f"{kolor} {sygnal_text}"
+            })
+        except Exception as e:
+            pass  # Ignorujemy błędy (np. gdy podasz zły ticker w polu tekstowym)
+
+    # Wyświetlanie gotowej tabeli
+    if summary_data:
+        df_summary = pd.DataFrame(summary_data)
+        # Ustawiamy 'Spółka' jako indeks, żeby tabela ładniej wyglądała
+        df_summary.set_index('Spółka', inplace=True)
+        st.dataframe(df_summary, use_container_width=True)
+    else:
+        st.warning("Brak danych do wyświetlenia w skanerze.")
+
+st.divider()  # Dodaje ładną, poziomą linię oddzielającą tabelę od reszty aplikacji
+
 
 # Pobieranie danych z Yahoo Finance na podstawie wybranych z kalendarza dat
 with st.spinner('Pobieram dane z giełdy dla wybranego okresu...'):
