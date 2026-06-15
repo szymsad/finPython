@@ -6,7 +6,7 @@ import datetime
 import os
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Zaawansowany MACD Bot", layout="wide")
+st.set_page_config(page_title="MACD Analiza", layout="wide")
 
 
 # --- TWOJE FUNKCJE LOGICZNE ---
@@ -48,12 +48,14 @@ st.sidebar.header("1. Twoje Spółki i Kapitał")
 WATCHLIST_FILE = "watchlist.txt"
 DEFAULT_TICKERS = "PKN.WA, DNP.WA, PKO.WA, KGH.WA, XTB.WA, AAPL, TSLA"
 
+
 # Funkcja wczytująca listę z pliku
 def load_watchlist():
     if os.path.exists(WATCHLIST_FILE):
         with open(WATCHLIST_FILE, "r") as f:
             return f.read().strip()
     return DEFAULT_TICKERS
+
 
 # Wczytujemy aktualną listę do pamięci sesji
 if 'current_watchlist' not in st.session_state:
@@ -84,7 +86,7 @@ ticker_symbol = st.sidebar.selectbox("🎯 Wybierz spółkę do analizy:", optio
 
 # Suwak kapitału
 saldo_poczatkowe = st.sidebar.number_input("Kapitał początkowy (zł):", value=1000.0, step=500.0, min_value=100.0)
-wielkosc_doplaty = st.sidebar.number_input("Wpłata miesięczna (zł):", value=500.0, step=50.0, min_value=100.0)
+wielkosc_doplaty = st.sidebar.number_input("Wpłata miesięczna (zł):", value=100.0, step=50.0, min_value=100.0)
 
 st.sidebar.header("2. Zakres Dat")
 today = datetime.date.today()
@@ -101,12 +103,15 @@ signal_span = st.sidebar.slider("Linia Sygnałowa", 3, 30, 9)
 st.sidebar.header("4. Strategia Kupna (Dołki)")
 poziom_dolka = st.sidebar.number_input("Próg głębokiego dołka (ujemny)", value=-2.0, step=0.5)
 duzy_wykup_pct = st.sidebar.slider("% kapitału na GŁĘBOKI dołek", 10, 100, 100) / 100
-maly_wykup_pct = st.sidebar.slider("% kapitału na zwykły dołek", 10, 100, 50) / 100
+maly_wykup_pct = st.sidebar.slider("% kapitału na zwykły dołek", 0, 100, 80) / 100
 
 st.sidebar.header("5. Strategia Sprzedaży (Górki)")
 poziom_gorki = st.sidebar.number_input("Próg dużej górki (dodatni)", value=2.0, step=0.5)
-duza_gorka_pct = st.sidebar.slider("% akcji na DUŻĄ górkę", 10, 100, 100) / 100
-mala_gorka_pct = st.sidebar.slider("% akcji na małą górkę", 10, 100, 50) / 100
+duza_gorka_pct = st.sidebar.slider("% akcji na DUŻĄ górkę", 10, 100, 40) / 100
+mala_gorka_pct = st.sidebar.slider("% akcji na małą górkę", 0, 100, 10) / 100
+
+st.sidebar.header("6. Ochrona przed prowizjami")
+cooldown_dni = st.sidebar.number_input("Minimalny odstęp między transakcjami (dni)", min_value=0, value=5, step=1)
 
 # Zabezpieczenie przed błędnym zakresem dat
 if start_date >= end_date:
@@ -198,6 +203,7 @@ else:
 
     saldo = saldo_poczatkowe
     suma_doplat = 0.0
+    ilosc_doplat = 0
     amount = 0
 
     date = data['Date'].tolist()
@@ -258,58 +264,68 @@ else:
     ax2.grid(True, alpha=0.3)
 
     # --- PĘTLA SYMULACJI ---
+    ostatnia_transakcja_idx = -999
+
     for i in range(len(MACD) - 1):
         cena_aktualna = ceny.iloc[i + 1]
         data_aktualna = date[i + 1]
         data_poprzednia = date[i]
 
-        # Mechanizm dopłat (500 zł co miesiąc)
         if data_aktualna.month != data_poprzednia.month:
             saldo += wielkosc_doplaty
             suma_doplat += wielkosc_doplaty
+            ilosc_doplat += 1
 
-        # Warunek przecięcia
+        # Sprawdzamy czy jest sygnał (przecięcie linii)
         if (MACD.iloc[i + 1] > signal.iloc[i + 1] and MACD.iloc[i] < signal.iloc[i]) or \
                 (MACD.iloc[i + 1] < signal.iloc[i + 1] and MACD.iloc[i] > signal.iloc[i]):
 
-            a1, b1 = straight_line(i, MACD.iloc[i], i + 1, MACD.iloc[i + 1])
-            a2, b2 = straight_line(i, signal.iloc[i], i + 1, signal.iloc[i + 1])
+            # NOWOŚĆ: Sprawdzamy, czy od ostatniej transakcji minęło wystarczająco dużo dni
+            if (i - ostatnia_transakcja_idx) >= cooldown_dni:
 
-            if (a1 - a2) != 0:
-                x = (b2 - b1) / (a1 - a2)
-                y = a2 * x + b2
-                punkt_data = date[i] + datetime.timedelta(days=float(x - i))
-            else:
-                punkt_data = date[i + 1]
-                y = MACD.iloc[i + 1]
+                a1, b1 = straight_line(i, MACD.iloc[i], i + 1, MACD.iloc[i + 1])
+                a2, b2 = straight_line(i, signal.iloc[i], i + 1, signal.iloc[i + 1])
 
-            # KUPNO (Przecięcie w górę)
-            if MACD.iloc[i + 1] > signal.iloc[i + 1]:
-                if y <= poziom_dolka:
-                    pct = duzy_wykup_pct;
-                    kol = 'green';
-                    s = 100
+                if (a1 - a2) != 0:
+                    x = (b2 - b1) / (a1 - a2)
+                    y = a2 * x + b2
+                    punkt_data = date[i] + datetime.timedelta(days=float(x - i))
                 else:
-                    pct = maly_wykup_pct;
-                    kol = 'lightgreen';
-                    s = 50
-                amount, saldo = buy(cena_aktualna, saldo, amount, pct)
-                ax2.plot(punkt_data, y, marker="o", color=kol)
-                ax1.scatter(data_aktualna, cena_aktualna, marker="^", color=kol, s=s, zorder=3)
+                    punkt_data = date[i + 1]
+                    y = MACD.iloc[i + 1]
 
-            # SPRZEDAŻ (Przecięcie w dół)
-            else:
-                if y >= poziom_gorki:
-                    pct = duza_gorka_pct;
-                    kol = 'red';
-                    s = 100
+                # KUPNO
+                if MACD.iloc[i + 1] > signal.iloc[i + 1]:
+                    pct = duzy_wykup_pct if y <= poziom_dolka else maly_wykup_pct
+                    kol = 'green' if y <= poziom_dolka else 'lightgreen'
+                    s = 100 if y <= poziom_dolka else 50
+
+                    # Wykonujemy zakup TYLKO jeśli nas na to stać
+                    stare_saldo = saldo
+                    amount, saldo = buy(cena_aktualna, saldo, amount, pct)
+                    if saldo != stare_saldo:  # Potwierdzenie, że transakcja doszła do skutku
+                        ostatnia_transakcja_idx = i  # Zapisujemy dzień transakcji
+                        ax2.plot(punkt_data, y, marker="o", color=kol)
+                        ax1.scatter(data_aktualna, cena_aktualna, marker="^", color=kol, s=s, zorder=3)
+
+                # SPRZEDAŻ
                 else:
-                    pct = mala_gorka_pct;
-                    kol = 'orange';
-                    s = 50
-                amount, saldo = sell(cena_aktualna, saldo, amount, pct)
-                ax2.plot(punkt_data, y, marker="o", color=kol)
-                ax1.scatter(data_aktualna, cena_aktualna, marker="v", color=kol, s=s, zorder=3)
+                    pct = duza_gorka_pct if y >= poziom_gorki else mala_gorka_pct
+                    kol = 'red' if y >= poziom_gorki else 'orange'
+                    s = 100 if y >= poziom_gorki else 50
+
+                    # Wykonujemy sprzedaż TYLKO jeśli mamy jakieś akcje
+                    stary_amount = amount
+                    amount, saldo = sell(cena_aktualna, saldo, amount, pct)
+                    if amount != stary_amount:  # Potwierdzenie, że transakcja doszła do skutku
+                        ostatnia_transakcja_idx = i  # Zapisujemy dzień transakcji
+                        ax2.plot(punkt_data, y, marker="o", color=kol)
+                        ax1.scatter(data_aktualna, cena_aktualna, marker="v", color=kol, s=s, zorder=3)
+
+            else:
+                # Bot wykrył przecięcie, ale ignoruje je z powodu trwającego cooldownu
+                pass
+
 
     # Rysowanie wykresu
     ax2.legend(loc='upper left')
@@ -328,6 +344,7 @@ else:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Końcowa Wartość Portfela", f"{wartosc_portfela:.2f} zł", f"{zysk_netto:.2f} zł ({stopa_zwrotu:.2f}%)")
     col2.metric("Suma Wpłat (Baza + Dopłaty)", f"{zainwestowano:.2f} zł")
+    col2.metric("Ile miesięcy", f"{ilosc_doplat} msc x {wielkosc_doplaty:.2f} zł")
     col3.metric("Wolna Gotówka", f"{saldo:.2f} zł")
     col4.metric("Stan Akcji", f"{amount} szt.", f"Kurs na koniec: {koncowa_cena:.2f} zł")
 
