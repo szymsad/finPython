@@ -902,69 +902,123 @@ with tab3:
 # TAB 4 — HYBRYDOWY SYSTEM SCORINGOWY
 # =====================================================================
 
+# =====================================================================
+# TAB 4 — HYBRYDOWY SYSTEM SCORINGOWY v2
+# =====================================================================
+# Wklej ten blok na końcu app.py, po zamknięciu bloku "with tab3:"
+# Zmień deklarację zakładek na:
+#   tab1, tab2, tab3, tab4 = st.tabs([
+#       "📈 Analiza MACD", "🏦 Kalkulator IKZE",
+#       "💰 Strategia DCA", "🧠 System Scoringowy"
+#   ])
+# =====================================================================
+
 with tab4:
-    st.header("🧠 System Decyzyjny Hybrydowy — Skaner Scoringowy")
-    st.caption("Wielowskaźnikowy model punktacji (0–100 pkt) z globalnym filtrem trendu WIG i automatycznym risk managementem.")
+    st.header("🧠 System Decyzyjny Hybrydowy")
+    st.caption("Wielowskaźnikowy model punktacji 0–100 pkt | Globalny filtr trendu WIG | Risk management SL/TP")
 
     # ── Sidebar sekcja 9 ─────────────────────────────────────────────
     st.sidebar.header("9. System Scoringowy")
+
     scoring_tickers_raw = st.sidebar.text_area(
         "📋 Spółki do skanowania (po przecinku):",
-        value=", ".join(watchlist[:10]),
-        help="Domyślnie używa listy obserwowanych z sekcji 1. Można nadpisać."
+        value=", ".join(watchlist[:15]),
+        help="Domyślnie lista z sekcji 1. Możesz nadpisać dowolnymi tickerami."
     )
     scoring_tickers = [t.strip().upper() for t in scoring_tickers_raw.split(",") if t.strip()]
 
-    indeks_glowny = st.sidebar.text_input(
-        "📊 Ticker indeksu (filtr trendu globalnego):",
-        value="^WIG",
-        help="WIG: ^WIG | WIG20: ^WIG20 | S&P500: ^GSPC"
+    _indeksy_opcje = {
+        "WIG (Polska — szeroki)":    "WIG.WA",
+        "WIG20 (Polska — blue chips)": "WIG20.WA",
+        "S&P 500 (USA)":             "GSPC",
+        "NASDAQ (USA)":              "IXIC",
+        "DAX (Niemcy)":              "GDAXI",
+        "Własny ticker...":          "__custom__",
+    }
+    _indeks_wybrany = st.sidebar.selectbox(
+        "📊 Indeks — globalny filtr trendu:",
+        options=list(_indeksy_opcje.keys()),
+        index=0,
+        help="Sprawdzany względem SMA200. Poniżej SMA200 → tryb BESSA."
     )
-    scoring_okres = st.sidebar.radio(
-        "Zakres danych do scoringu:",
-        ["6M", "1Y", "2Y"],
-        index=1,
-        horizontal=True
-    )
-    _okres_map = {"6M": "6mo", "1Y": "1y", "2Y": "2y"}
-    scoring_period = _okres_map[scoring_okres]
+    if _indeks_wybrany == "Własny ticker...":
+        indeks_glowny = st.sidebar.text_input("Ticker indeksu:", value="WIG.WA").strip()
+    else:
+        indeks_glowny = _indeksy_opcje[_indeks_wybrany]
 
-    prog_kupuj = st.sidebar.slider("Próg KUPUJ (pkt)", 30, 80, 55, help="Score >= ta wartość = sygnał KUPUJ")
-    prog_obserwuj = st.sidebar.slider("Próg OBSERWUJ+ (pkt)", 15, 60, 35, help="Score >= ta wartość = OBSERWUJ+")
-    sl_pct = st.sidebar.number_input("Stop Loss (%)", value=6.0, min_value=1.0, max_value=20.0, step=0.5) / 100
+    scoring_okres = st.sidebar.radio(
+        "Zakres danych:", ["6M", "1Y", "2Y"], index=1, horizontal=True
+    )
+    scoring_period = {"6M": "6mo", "1Y": "1y", "2Y": "2y"}[scoring_okres]
+
+    prog_kupuj   = st.sidebar.slider("Próg KUPUJ (pkt)",    30, 80, 40,
+                                     help="Score ≥ ta wartość → sygnał KUPUJ w hossie")
+    prog_obserwuj = st.sidebar.slider("Próg OBSERWUJ+ (pkt)", 15, 60, 25,
+                                      help="Score ≥ ta wartość → OBSERWUJ+")
+    sl_pct = st.sidebar.number_input("Stop Loss (%)",   value=6.0,  min_value=1.0, max_value=20.0, step=0.5) / 100
     tp_pct = st.sidebar.number_input("Take Profit (%)", value=10.0, min_value=1.0, max_value=50.0, step=0.5) / 100
 
-    # ── Funkcja scoringowa ────────────────────────────────────────────
-    def oblicz_score(df: pd.DataFrame, rsi_okres_s: int = 14) -> dict:
+    # Próg słabego tygodniowego trendu spółki (!W)
+    prog_slaby_trend_tygodniowy = st.sidebar.slider(
+        "Próg słabości trendu tyg. (!W) — SMA tygodniowa okres", 5, 40, 20,
+        help="Spółka dostaje flagę !W jeśli jej cena jest poniżej tej SMA liczonej na danych tygodniowych"
+    )
+
+    # ── Funkcje pomocnicze ────────────────────────────────────────────
+
+    def _sma(series: pd.Series, okres: int) -> pd.Series:
+        return series.rolling(window=min(okres, len(series))).mean()
+
+    def _czy_slaby_trend_tygodniowy(ticker: str, prog_sma: int) -> bool:
+        """Pobiera dane tygodniowe i sprawdza czy cena < SMA(prog_sma)."""
+        try:
+            df_w = yf.Ticker(ticker).history(period="2y", interval="1wk")
+            if df_w.empty or len(df_w) < prog_sma // 2:
+                return False
+            c = df_w['Close'].dropna()
+            sma_w = c.rolling(window=min(prog_sma, len(c))).mean()
+            return bool(c.iloc[-1] < sma_w.iloc[-1])
+        except Exception:
+            return False
+
+    def oblicz_score_hybryd(df: pd.DataFrame) -> dict | None:
         """
-        Oblicza score 0-100 wg modelu hybrydowego.
-        Zwraca dict z komponentami i finalnym statusem.
+        Model punktowy 0–100:
+          Trend SMA200     30 pkt  (cena > SMA200)
+          RSI strefa       30 pkt  (50–70 = 30 | 40–50 = 15)
+          ROC10 momentum   30 pkt  (>5% = 30 | >0% = 20)
+          Wolumen          10 pkt  (vol > 1.2 × avg20)
+
+        Overrides:
+          WYKUPIENIE    — RSI > 75 (niezależnie od score)
+          SPADAJĄCY NÓŻ — cena < SMA200 AND ROC10 < –5% → score = 0
+          UNIKAJ TREND- — cena < SMA200 AND ROC10 >= –5% → score = 0
+          REAKCJA POPYTU — score = 0, cena < SMA200, ROC10 w [–3%, +3%],
+                           vol_ratio > 1.5 (wyraźny popyt mimo słabości)
         """
         if df is None or len(df) < 25:
             return None
 
-        close = df['Close']
+        close  = df['Close']
         volume = df['Volume']
 
-        # Wskaźniki
-        sma200 = close.ewm(span=200, min_periods=min(200, len(close))).mean()
-        rsi = oblicz_rsi(close, rsi_okres_s)
-        roc10 = (close / close.shift(10) - 1) * 100  # Rate of Change 10 dni
+        sma200   = close.ewm(span=200, min_periods=min(200, len(close))).mean()
+        rsi      = oblicz_rsi(close, 14)
+        roc10    = (close / close.shift(10) - 1) * 100
         vol_avg20 = volume.rolling(20).mean()
 
-        # Ostatnie wartości
-        last_close = close.iloc[-1]
-        last_sma200 = sma200.iloc[-1]
-        last_rsi = rsi.iloc[-1]
-        last_roc10 = roc10.iloc[-1]
-        last_vol = volume.iloc[-1]
-        last_volavg = vol_avg20.iloc[-1]
+        last_close   = float(close.iloc[-1])
+        last_sma200  = float(sma200.iloc[-1])
+        last_rsi     = float(rsi.iloc[-1])
+        last_roc10   = float(roc10.iloc[-1]) if pd.notna(roc10.iloc[-1]) else 0.0
+        last_vol     = float(volume.iloc[-1])
+        last_volavg  = float(vol_avg20.iloc[-1]) if pd.notna(vol_avg20.iloc[-1]) else 0.0
+        vol_ratio    = (last_vol / last_volavg) if last_volavg > 0 else 0.0
+        ponad_sma200 = last_close > last_sma200
 
-        # ── Składniki punktacji ────────────────────────────────────
-        # 1. Długoterminowy trend (30 pkt)
-        trend_pts = 30 if last_close > last_sma200 else 0
+        # ── Składniki ────────────────────────────────────────────────
+        trend_pts = 30 if ponad_sma200 else 0
 
-        # 2. Siła RSI (30 pkt)
         if 50 <= last_rsi <= 70:
             rsi_pts = 30
         elif 40 <= last_rsi < 50:
@@ -972,317 +1026,368 @@ with tab4:
         else:
             rsi_pts = 0
 
-        # 3. Momentum ROC10 (30 pkt)
-        if pd.notna(last_roc10):
-            if last_roc10 > 5:
-                roc_pts = 30   # dynamika przyspiesza
-            elif last_roc10 > 0:
-                roc_pts = 20   # pozytywny pęd
-            else:
-                roc_pts = 0
+        if last_roc10 > 5:
+            roc_pts = 30
+        elif last_roc10 > 0:
+            roc_pts = 20
         else:
             roc_pts = 0
 
-        # 4. Potwierdzenie wolumenu (10 pkt)
-        if pd.notna(last_volavg) and last_volavg > 0:
-            vol_pts = 10 if last_vol > 1.2 * last_volavg else 0
-        else:
-            vol_pts = 0
+        vol_pts = 10 if vol_ratio > 1.2 else 0
 
-        score_raw = trend_pts + rsi_pts + roc_pts + vol_pts
+        score = trend_pts + rsi_pts + roc_pts + vol_pts
 
-        # ── Logika ochronna — override Score ──────────────────────
-        falling_knife = (last_close < last_sma200) and (pd.notna(last_roc10) and last_roc10 < -5)
-        wykupienie = last_rsi > 75
+        # ── Flagi ochronne ────────────────────────────────────────────
+        wykupienie    = last_rsi > 75
+        falling_knife = (not ponad_sma200) and (last_roc10 < -5)
+        unikaj_trend  = (not ponad_sma200) and (not falling_knife)   # poniżej SMA200, ROC neutralny
+        reakcja_popytu = (
+            not ponad_sma200
+            and not falling_knife
+            and (-3 <= last_roc10 <= 3)
+            and vol_ratio > 1.5
+        )
 
-        if falling_knife:
-            score_raw = 0  # zerowanie przy "spadającym nożu"
+        # Zerowanie score dla spółek poniżej SMA200
+        if not ponad_sma200:
+            score = 0
 
         return {
-            "close": last_close,
-            "sma200": last_sma200,
-            "rsi": last_rsi,
-            "roc10": last_roc10 if pd.notna(last_roc10) else 0.0,
-            "vol_ratio": (last_vol / last_volavg) if (pd.notna(last_volavg) and last_volavg > 0) else 0.0,
-            "score": score_raw,
-            "trend_pts": trend_pts,
-            "rsi_pts": rsi_pts,
-            "roc_pts": roc_pts,
-            "vol_pts": vol_pts,
-            "falling_knife": falling_knife,
-            "wykupienie": wykupienie,
-            "ponad_sma200": last_close > last_sma200,
+            "close":        last_close,
+            "sma200":       last_sma200,
+            "rsi":          last_rsi,
+            "roc10":        last_roc10,
+            "vol_ratio":    vol_ratio,
+            "score":        score,
+            "trend_pts":    trend_pts,
+            "rsi_pts":      rsi_pts,
+            "roc_pts":      roc_pts,
+            "vol_pts":      vol_pts,
+            "ponad_sma200": ponad_sma200,
+            "wykupienie":   wykupienie,
+            "falling_knife":  falling_knife,
+            "unikaj_trend":   unikaj_trend,
+            "reakcja_popytu": reakcja_popytu,
         }
 
-
-    def wyznacz_status(dane: dict, hossa: bool, prog_kupuj: int, prog_obserwuj: int) -> tuple[str, str]:
-        """Zwraca (emoji_status, opis) na podstawie score i flag ochronnych."""
-        if dane["wykupienie"]:
-            return "🟪", "WYKUPIENIE (TP)"
-        if dane["falling_knife"]:
-            return "🟥", "SPADAJĄCY NÓŻ"
-        score = dane["score"]
+    def wyznacz_status(d: dict, hossa: bool, slaby_trend_tygodniowy: bool,
+                       prog_kupuj: int, prog_obserwuj: int) -> tuple[str, str]:
+        """
+        Hierarchia statusów (priorytet od góry):
+          1. WYKUPIENIE (TP)   — RSI > 75
+          2. SPADAJĄCY NÓŻ     — poniżej SMA200, ROC10 < –5%
+          3. REAKCJA POPYTU    — poniżej SMA200, neutralny ROC, duży wolumen
+          4. UNIKAJ (TREND-)   — poniżej SMA200, ROC neutralny (bez reakcji popytu)
+          5. KUPUJ (trend+)    — score ≥ prog_kupuj, hossa
+          6. CZEKAJ (Bessa)    — score ≥ prog_kupuj, bessa
+          7. OBSERWUJ+         — score ≥ prog_obserwuj
+          8. OBSERWUJ          — score > 0
+          9. OBSERWUJ          — score = 0 (domyślny fallback)
+        """
+        if d["wykupienie"]:
+            return "WYKUPIENIE(TP)", "🟪"
+        if d["falling_knife"]:
+            return "SPADAJĄCY NÓŻ", "🟥"
+        if d["reakcja_popytu"]:
+            return "REAKCJA POPYTU", "🔵"
+        if d["unikaj_trend"]:
+            return "UNIKAJ (TREND-)", "⛔"
+        # spółka ponad SMA200
+        score = d["score"]
         if score >= prog_kupuj:
             if hossa:
-                return "🟩", "KUPUJ (trend+)"
+                return "KUPUJ (trend+)", "🟩"
             else:
-                return "🟡", "CZEKAJ (Bessa)"
+                return "CZEKAJ (Bessa)", "🟡"
         elif score >= prog_obserwuj:
-            return "🟢", "OBSERWUJ+"
+            return "OBSERWUJ+", "🟢"
         else:
-            return "⚪", "CZEKAJ"
+            return "OBSERWUJ", "⚪"
 
-
-    # ── Pobieranie filtra globalnego (WIG) ───────────────────────────
+    # ── 1. Globalny filtr trendu (WIG) ────────────────────────────────
     with st.spinner(f"📡 Sprawdzam globalny trend ({indeks_glowny})..."):
         try:
             df_wig = yf.Ticker(indeks_glowny).history(period="2y")
             if df_wig.empty:
-                raise ValueError("Brak danych indeksu")
+                raise ValueError("Brak danych")
             df_wig = df_wig.reset_index()
             df_wig['Date'] = pd.to_datetime(df_wig['Date']).dt.tz_localize(None)
-            wig_close = df_wig['Close']
-            wig_sma200 = wig_close.ewm(span=200, min_periods=min(200, len(wig_close))).mean()
-            wig_last = wig_close.iloc[-1]
-            wig_sma_last = wig_sma200.iloc[-1]
-            hossa = wig_last > wig_sma_last
-            diff_pct = (wig_last / wig_sma_last - 1) * 100
-            filtr_ok = True
-        except Exception as e:
-            hossa = True   # fallback — nie blokujemy jeśli brak danych indeksu
+            wig_close   = df_wig['Close']
+            wig_sma200  = wig_close.ewm(span=200, min_periods=min(200, len(wig_close))).mean()
+            wig_last    = float(wig_close.iloc[-1])
+            wig_sma_val = float(wig_sma200.iloc[-1])
+            hossa       = wig_last > wig_sma_val
+            diff_pct    = (wig_last / wig_sma_val - 1) * 100
+            filtr_ok    = True
+        except Exception:
+            hossa = True
             filtr_ok = False
-            wig_last = None
-            wig_sma_last = None
-            diff_pct = 0.0
+            wig_last = wig_sma_val = diff_pct = None
 
-    # ── Nagłówek: stan rynku ─────────────────────────────────────────
-    col_mkt1, col_mkt2, col_mkt3 = st.columns([2, 2, 3])
-    with col_mkt1:
+    # Nagłówek stanu rynku
+    c1, c2, c3 = st.columns([2, 2, 3])
+    with c1:
         if filtr_ok:
-            tryb_label = "🐂 HOSSA (Aktywny)" if hossa else "🐻 BESSA (Defensywny)"
-            tryb_delta = f"{diff_pct:+.2f}% vs SMA200"
-            st.metric(f"Filtr globalny: {indeks_glowny}", f"{wig_last:.0f}" if wig_last else "—", tryb_delta)
+            st.metric(
+                f"Indeks: {indeks_glowny}",
+                f"{wig_last:,.0f}",
+                f"{diff_pct:+.2f}% vs SMA200"
+            )
         else:
-            st.warning(f"⚠️ Nie udało się pobrać danych dla {indeks_glowny}. Filtr wyłączony.")
-    with col_mkt2:
+            st.warning(f"⚠️ Brak danych dla {indeks_glowny} — filtr wyłączony (tryb aktywny domyślnie).")
+    with c2:
         if filtr_ok:
             if hossa:
-                st.success(f"**{tryb_label}**\nSygnały KUPUJ aktywne.")
+                st.success("🐂 **HOSSA (WIG > SMA200)**\n\nTryb: Aktywny")
             else:
-                st.warning(f"**{tryb_label}**\nSygnały KUPUJ zamieniane na CZEKAJ.")
-    with col_mkt3:
+                st.warning("🐻 **BESSA (WIG < SMA200)**\n\nTryb: Defensywny — sygnały KUPUJ zablokowane")
+    with c3:
         st.info(
-            f"**Progi punktowe:** KUPUJ ≥ {prog_kupuj} pkt | OBSERWUJ ≥ {prog_obserwuj} pkt\n\n"
-            f"**Risk management:** SL = −{sl_pct*100:.1f}% | TP = +{tp_pct*100:.1f}%"
+            f"**Progi:** KUPUJ ≥ {prog_kupuj} pkt | OBSERWUJ ≥ {prog_obserwuj} pkt\n\n"
+            f"**Risk management:** SL = −{sl_pct*100:.1f}% | TP = +{tp_pct*100:.1f}%\n\n"
+            f"**Flaga !W:** słabość trendu tygodniowego (SMA{prog_slaby_trend_tygodniowy}W)"
         )
 
     st.divider()
 
-    # ── Skanowanie spółek ─────────────────────────────────────────────
+    # ── 2. Skanowanie spółek ─────────────────────────────────────────
     with st.spinner(f"🔍 Skanowanie {len(scoring_tickers)} spółek..."):
-        wyniki_scoringu = []
 
+        # Zbiór tickerów znanych w poprzedniej sesji (session_state)
+        if "scoring_poprzednie" not in st.session_state:
+            st.session_state["scoring_poprzednie"] = set()
+        poprzednie = st.session_state["scoring_poprzednie"]
+        aktualne_sygnaly = set()
+
+        wyniki = []
         for t in scoring_tickers:
             try:
                 df_t = yf.Ticker(t).history(period=scoring_period)
                 if df_t.empty or len(df_t) < 15:
-                    wyniki_scoringu.append({
-                        "Spółka": t, "Kurs (zł)": "—", "SMA200": "—",
-                        "RSI": "—", "ROC10 (%)": "—", "Vol/Avg": "—",
-                        "Trend": "—", "RSI pkt": "—", "ROC pkt": "—", "Vol pkt": "—",
-                        "SCORE": "—", "Status": "⚠️", "Opis": "Brak danych",
-                        "Stop Loss": "—", "Take Profit": "—"
-                    })
+                    wyniki.append({"_ticker": t, "_ok": False, "_err": "Brak danych"})
                     continue
 
                 df_t = df_t.reset_index()
                 df_t['Date'] = pd.to_datetime(df_t['Date']).dt.tz_localize(None)
                 df_t = df_t.dropna(subset=['Close']).reset_index(drop=True)
 
-                dane = oblicz_score(df_t)
-                if dane is None:
-                    wyniki_scoringu.append({
-                        "Spółka": t, "Kurs (zł)": "—", "SMA200": "—",
-                        "RSI": "—", "ROC10 (%)": "—", "Vol/Avg": "—",
-                        "Trend": "—", "RSI pkt": "—", "ROC pkt": "—", "Vol pkt": "—",
-                        "SCORE": "—", "Status": "⚠️", "Opis": "Za mało danych",
-                        "Stop Loss": "—", "Take Profit": "—"
-                    })
+                d = oblicz_score_hybryd(df_t)
+                if d is None:
+                    wyniki.append({"_ticker": t, "_ok": False, "_err": "Za mało danych"})
                     continue
 
-                emoji, opis = wyznacz_status(dane, hossa, prog_kupuj, prog_obserwuj)
+                slaby_tygodniowy = _czy_slaby_trend_tygodniowy(t, prog_slaby_trend_tygodniowy)
+                status_opis, status_emoji = wyznacz_status(
+                    d, hossa, slaby_tygodniowy, prog_kupuj, prog_obserwuj
+                )
 
-                sl_price = dane["close"] * (1 - sl_pct)
-                tp_price = dane["close"] * (1 + tp_pct)
+                # Flaga NEW — pojawia się gdy spółka osiąga KUPUJ/OBSERWUJ+ po raz pierwszy
+                jest_sygnalowa = status_opis in ("KUPUJ (trend+)", "OBSERWUJ+", "CZEKAJ (Bessa)")
+                if jest_sygnalowa:
+                    aktualne_sygnaly.add(t)
+                nowy = jest_sygnalowa and (t not in poprzednie)
 
-                wyniki_scoringu.append({
-                    "Spółka": t,
-                    "Kurs": round(dane["close"], 2),
-                    "SMA200": round(dane["sma200"], 2),
-                    "RSI": round(dane["rsi"], 1),
-                    "ROC10 (%)": round(dane["roc10"], 2),
-                    "Vol/Avg": round(dane["vol_ratio"], 2),
-                    "Trend (30)": dane["trend_pts"],
-                    "RSI (30)": dane["rsi_pts"],
-                    "ROC (30)": dane["roc_pts"],
-                    "Vol (10)": dane["vol_pts"],
-                    "SCORE": dane["score"],
-                    "Status": f"{emoji} {opis}",
-                    "SL": round(sl_price, 2),
-                    "TP": round(tp_price, 2),
-                    "_score_raw": dane["score"],
-                    "_emoji": emoji,
-                    "_falling_knife": dane["falling_knife"],
-                    "_wykupienie": dane["wykupienie"],
+                # Obrot w PLN
+                obrot_pln = df_t['Volume'].iloc[-1] * d["close"] if len(df_t) > 0 else 0
+
+                wyniki.append({
+                    "_ticker":       t,
+                    "_ok":           True,
+                    "_score":        d["score"],
+                    "_status_opis":  status_opis,
+                    "_status_emoji": status_emoji,
+                    "_nowy":         nowy,
+                    "_slaby_w":      slaby_tygodniowy,
+                    "_falling_knife": d["falling_knife"],
+                    "_wykupienie":   d["wykupienie"],
+                    "_reakcja":      d["reakcja_popytu"],
+                    # Kolumny widoczne w tabeli
+                    "Nowy?":         "NEW" if nowy else "...",
+                    "Spółka":        f"{t} !W" if slaby_tygodniowy else t,
+                    "Cena":          round(d["close"], 2),
+                    "RSI":           round(d["rsi"], 1),
+                    "ROC10":         round(d["roc10"], 2),
+                    "Vol/Avg":       round(d["vol_ratio"], 2),
+                    "Obrot":         f"{obrot_pln/1e6:.2f}M" if obrot_pln > 1e6 else f"{obrot_pln/1e3:.0f}k",
+                    "SMA200":        round(d["sma200"], 2),
+                    "T(30)":         d["trend_pts"],
+                    "R(30)":         d["rsi_pts"],
+                    "M(30)":         d["roc_pts"],
+                    "V(10)":         d["vol_pts"],
+                    "SCORE":         d["score"],
+                    "SL":            round(d["close"] * (1 - sl_pct), 2) if d["ponad_sma200"] else "—",
+                    "TP":            round(d["close"] * (1 + tp_pct), 2) if d["ponad_sma200"] else "—",
+                    "STATUS":        f"{status_emoji} {status_opis}",
                 })
 
             except Exception as ex:
-                wyniki_scoringu.append({
-                    "Spółka": t, "Kurs": "—", "SMA200": "—",
-                    "RSI": "—", "ROC10 (%)": "—", "Vol/Avg": "—",
-                    "Trend (30)": "—", "RSI (30)": "—", "ROC (30)": "—", "Vol (10)": "—",
-                    "SCORE": "—", "Status": f"⚠️ Błąd: {str(ex)[:40]}",
-                    "SL": "—", "TP": "—",
-                    "_score_raw": -1, "_emoji": "⚠️",
-                    "_falling_knife": False, "_wykupienie": False,
-                })
+                wyniki.append({"_ticker": t, "_ok": False, "_err": str(ex)[:60]})
 
-    # Sortowanie: najpierw wg score malejąco, błędy na końcu
-    def sort_key(r):
-        s = r.get("_score_raw", -1)
-        return s if isinstance(s, (int, float)) else -1
+        # Aktualizuj session_state
+        st.session_state["scoring_poprzednie"] = aktualne_sygnaly
 
-    wyniki_scoringu.sort(key=sort_key, reverse=True)
+    # ── Sortowanie ────────────────────────────────────────────────────
+    # Kolejność: KUPUJ → OBSERWUJ+ → OBSERWUJ → REAKCJA → UNIKAJ → SPADAJĄCY NÓŻ → WYKUPIENIE → błędy
+    _prio = {
+        "KUPUJ (trend+)": 0, "CZEKAJ (Bessa)": 1,
+        "OBSERWUJ+": 2, "OBSERWUJ": 3,
+        "REAKCJA POPYTU": 4, "UNIKAJ (TREND-)": 5,
+        "SPADAJĄCY NÓŻ": 6, "WYKUPIENIE(TP)": 7,
+    }
 
-    # ── Tabela wynikowa ───────────────────────────────────────────────
+    def _sort_key(r):
+        if not r.get("_ok"):
+            return (99, 0)
+        prio = _prio.get(r.get("_status_opis", ""), 8)
+        return (prio, -r.get("_score", 0))
+
+    wyniki.sort(key=_sort_key)
+
+    # ── 3. Tabela wynikowa ────────────────────────────────────────────
     st.subheader("📊 Matryca Scoringowa")
 
-    kolumny_tabeli = ["Spółka", "Kurs", "SMA200", "RSI", "ROC10 (%)", "Vol/Avg",
-                      "Trend (30)", "RSI (30)", "ROC (30)", "Vol (10)", "SCORE", "Status", "SL", "TP"]
+    wiersze_ok  = [r for r in wyniki if r.get("_ok")]
+    wiersze_err = [r for r in wyniki if not r.get("_ok")]
 
-    df_wyniki = pd.DataFrame([
-        {k: v for k, v in r.items() if not k.startswith("_")}
-        for r in wyniki_scoringu
-    ])
+    kolumny = ["Nowy?", "Spółka", "Cena", "RSI", "ROC10", "Vol/Avg",
+               "Obrot", "SMA200", "T(30)", "R(30)", "M(30)", "V(10)", "SCORE", "SL", "TP", "STATUS"]
 
-    if not df_wyniki.empty and "Spółka" in df_wyniki.columns:
-        df_wyniki = df_wyniki.set_index("Spółka")
-        st.dataframe(df_wyniki, use_container_width=True)
+    if wiersze_ok:
+        df_tab = pd.DataFrame(wiersze_ok)[kolumny].set_index("Spółka")
+        st.dataframe(df_tab, use_container_width=True)
     else:
-        st.warning("Brak wyników do wyświetlenia.")
+        st.warning("Brak wyników — sprawdź tickery i zakres dat.")
+
+    if wiersze_err:
+        with st.expander(f"⚠️ Błędy pobierania ({len(wiersze_err)} spółek)", expanded=False):
+            for r in wiersze_err:
+                st.caption(f"{r['_ticker']}: {r.get('_err','—')}")
 
     st.divider()
 
-    # ── Sygnały alertowe ──────────────────────────────────────────────
-    st.subheader("🚨 Aktywne sygnały")
+    # ── 4. TOP 5 najlepszych okazji ───────────────────────────────────
+    st.subheader("⭐ TOP 5 najlepszych okazji rynkowych")
 
-    kupuj_lista = [r for r in wyniki_scoringu if r.get("_emoji") in ("🟩",)]
-    obserwuj_lista = [r for r in wyniki_scoringu if r.get("_emoji") in ("🟢",)]
-    bessa_lista = [r for r in wyniki_scoringu if r.get("_emoji") in ("🟡",)]
-    noz_lista = [r for r in wyniki_scoringu if r.get("_falling_knife")]
-    wykup_lista = [r for r in wyniki_scoringu if r.get("_wykupienie")]
+    top5 = [r for r in wiersze_ok if r["_status_opis"] in
+            ("KUPUJ (trend+)", "CZEKAJ (Bessa)", "OBSERWUJ+")][:5]
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if kupuj_lista:
-            for r in kupuj_lista:
+    if top5:
+        for i, r in enumerate(top5, 1):
+            ticker_wyswietlany = r["_ticker"]
+            score = r["SCORE"]
+            cena  = r["Cena"]
+            sl    = r["SL"]
+            tp    = r["TP"]
+            emoji = r["_status_emoji"]
+            opis  = r["_status_opis"]
+            nowy_tag = " **[NOWY SYGNAŁ!]**" if r["_nowy"] else ""
+
+            if score >= prog_kupuj:
+                komunikat = f"Score: {score}/100 → Generuje sygnał wejścia po ok. {cena} PLN{nowy_tag}"
+            else:
+                komunikat = f"Score: {score}/100 → Tylko obserwacja / Czekaj na silniejszy sygnał (score >= {prog_kupuj}){nowy_tag}"
+
+            st.markdown(f"**{i}. {ticker_wyswietlany}** &nbsp;&nbsp; {emoji} {komunikat}")
+    else:
+        st.info("Brak spółek kwalifikujących się do TOP 5. Obniż progi lub rozszerz listę spółek.")
+
+    st.divider()
+
+    # ── 5. Sekcja alertów ─────────────────────────────────────────────
+    st.subheader("🚨 Aktywne alerty")
+
+    kupuj_l   = [r for r in wiersze_ok if r["_status_opis"] == "KUPUJ (trend+)"]
+    bessa_l   = [r for r in wiersze_ok if r["_status_opis"] == "CZEKAJ (Bessa)"]
+    wykup_l   = [r for r in wiersze_ok if r["_wykupienie"]]
+    noz_l     = [r for r in wiersze_ok if r["_falling_knife"]]
+    reakcja_l = [r for r in wiersze_ok if r["_reakcja"]]
+
+    ca, cb = st.columns(2)
+    with ca:
+        if kupuj_l:
+            for r in kupuj_l:
                 st.success(
-                    f"🟩 **{r['Spółka']}** — KUPUJ (trend+)\n\n"
-                    f"Score: **{r['SCORE']} pkt** | Kurs: {r.get('Kurs','—')} zł | "
-                    f"RSI: {r.get('RSI','—')} | ROC10: {r.get('ROC10 (%)','—')}%\n\n"
-                    f"📍 SL: **{r.get('SL','—')} zł** (−{sl_pct*100:.1f}%) | "
-                    f"TP: **{r.get('TP','—')} zł** (+{tp_pct*100:.1f}%)"
+                    f"🟩 **{r['_ticker']}** — KUPUJ (trend+)"
+                    + (" 🆕" if r["_nowy"] else "") + "\n\n"
+                    f"Score: **{r['SCORE']} pkt** | RSI: {r['RSI']} | ROC10: {r['ROC10']:+.1f}%\n\n"
+                    f"📍 SL: **{r['SL']} zł** | TP: **{r['TP']} zł**"
                 )
-        elif not bessa_lista:
-            st.info("Brak sygnałów KUPUJ w bieżącym skanowaniu.")
-
-        if bessa_lista:
-            for r in bessa_lista:
+        if bessa_l:
+            for r in bessa_l:
                 st.warning(
-                    f"🟡 **{r['Spółka']}** — Score {r['SCORE']} pkt, ale rynek w BESSIE.\n\n"
-                    f"RSI: {r.get('RSI','—')} | ROC10: {r.get('ROC10 (%)','—')}%\n"
-                    f"Czekaj na potwierdzenie trendu indeksu."
+                    f"🟡 **{r['_ticker']}** — Score {r['SCORE']} pkt, lecz WIG w bessie\n\n"
+                    f"Czekaj na powrót indeksu powyżej SMA200."
                 )
+        if not kupuj_l and not bessa_l:
+            st.info("Brak aktywnych sygnałów KUPUJ.")
 
-    with col_b:
-        if wykup_lista:
-            for r in wykup_lista:
+    with cb:
+        if wykup_l:
+            for r in wykup_l:
                 st.warning(
-                    f"🟪 **{r['Spółka']}** — WYKUPIENIE (RSI > 75)\n\n"
-                    f"RSI: **{r.get('RSI','—')}** | Kurs: {r.get('Kurs','—')} zł\n"
-                    f"Rozważ realizację zysku. TP: {r.get('TP','—')} zł"
+                    f"🟪 **{r['_ticker']}** — WYKUPIENIE (RSI={r['RSI']:.0f} > 75)\n\n"
+                    f"Rozważ realizację zysku. TP: {r['TP']} zł"
                 )
-
-        if noz_lista:
-            for r in noz_lista:
+        if noz_l:
+            for r in noz_l:
                 st.error(
-                    f"🟥 **{r['Spółka']}** — SPADAJĄCY NÓŻ (Score = 0)\n\n"
-                    f"Cena poniżej SMA200, ROC10: {r.get('ROC10 (%)','—')}%\n"
-                    f"**ZAKAZ KUPNA.** Czekaj na stabilizację."
+                    f"🟥 **{r['_ticker']}** — SPADAJĄCY NÓŻ\n\n"
+                    f"Cena < SMA200, ROC10 = {r['ROC10']:+.1f}% — **zakaz kupna**."
                 )
-
-        if obserwuj_lista:
-            with st.expander(f"🟢 OBSERWUJ+ ({len(obserwuj_lista)} spółek)", expanded=False):
-                for r in obserwuj_lista:
+        if reakcja_l:
+            with st.expander(f"🔵 REAKCJA POPYTU ({len(reakcja_l)} spółek)", expanded=False):
+                for r in reakcja_l:
                     st.markdown(
-                        f"**{r['Spółka']}** — Score: {r['SCORE']} pkt | "
-                        f"Kurs: {r.get('Kurs','—')} zł | RSI: {r.get('RSI','—')}"
+                        f"**{r['_ticker']}** — Vol/Avg: {r['Vol/Avg']:.1f}x | "
+                        f"ROC10: {r['ROC10']:+.1f}% | Obserwuj odbicie, nie kupuj."
                     )
 
     st.divider()
 
-    # ── Wykres: rozkład score z paskami składowymi ────────────────────
-    st.subheader("📈 Rozkład punktacji spółek")
+    # ── 6. Wykres składowych ──────────────────────────────────────────
+    st.subheader("📈 Rozkład punktacji")
 
-    df_plot = pd.DataFrame([
-        r for r in wyniki_scoringu
-        if isinstance(r.get("_score_raw"), (int, float)) and r["_score_raw"] >= 0
-    ])
+    df_plot = pd.DataFrame([r for r in wiersze_ok if r["SCORE"] > 0])
 
     if not df_plot.empty:
-        df_plot = df_plot.sort_values("_score_raw", ascending=True)
-        spółki = df_plot["Spółka"].tolist()
-        trend_v = pd.to_numeric(df_plot["Trend (30)"], errors='coerce').fillna(0).tolist()
-        rsi_v = pd.to_numeric(df_plot["RSI (30)"], errors='coerce').fillna(0).tolist()
-        roc_v = pd.to_numeric(df_plot["ROC (30)"], errors='coerce').fillna(0).tolist()
-        vol_v = pd.to_numeric(df_plot["Vol (10)"], errors='coerce').fillna(0).tolist()
+        df_plot = df_plot.sort_values("SCORE", ascending=True)
+        spk  = df_plot["Spółka"].tolist()
+        tv   = df_plot["T(30)"].tolist()
+        rv   = df_plot["R(30)"].tolist()
+        mv   = df_plot["M(30)"].tolist()
+        vv   = df_plot["V(10)"].tolist()
+        left_r = [a + b for a, b in zip(tv, rv)]
+        left_m = [a + b for a, b in zip(left_r, mv)]  # poprawiona zmienna
 
-        fig_score, ax_score = plt.subplots(figsize=(12, max(4, len(spółki) * 0.55)))
+        fig_s, ax_s = plt.subplots(figsize=(12, max(4, len(spk) * 0.52)))
+        ax_s.barh(spk, tv,                         color='#2196F3', label='Trend SMA200 (30)')
+        ax_s.barh(spk, rv,   left=tv,              color='#4CAF50', label='RSI strefa (30)')
+        ax_s.barh(spk, mv,   left=left_r,          color='#FF9800', label='ROC10 momentum (30)')
+        ax_s.barh(spk, vv,   left=left_m,          color='#9C27B0', label='Wolumen (10)')
 
-        # Poziome paski składowe
-        bars1 = ax_score.barh(spółki, trend_v, color='#2196F3', label='Trend SMA200 (30)')
-        bars2 = ax_score.barh(spółki, rsi_v, left=trend_v, color='#4CAF50', label='RSI strefa (30)')
-        left_roc = [a + b for a, b in zip(trend_v, rsi_v)]
-        bars3 = ax_score.barh(spółki, roc_v, left=left_roc, color='#FF9800', label='ROC10 momentum (30)')
-        left_vol = [a + b for a, b in zip(left_roc, roc_v)]
-        bars4 = ax_score.barh(spółki, vol_v, left=left_vol, color='#9C27B0', label='Wolumen (10)')
+        ax_s.axvline(prog_kupuj,   color='lime',   lw=1.5, ls='--', alpha=0.9, label=f'Próg KUPUJ ({prog_kupuj})')
+        ax_s.axvline(prog_obserwuj, color='orange', lw=1.2, ls=':',  alpha=0.8, label=f'Próg OBSERWUJ ({prog_obserwuj})')
 
-        # Linie progowe
-        ax_score.axvline(prog_kupuj, color='green', linewidth=1.5, linestyle='--', alpha=0.8, label=f'Próg KUPUJ ({prog_kupuj})')
-        ax_score.axvline(prog_obserwuj, color='orange', linewidth=1.2, linestyle=':', alpha=0.7, label=f'Próg OBSERWUJ ({prog_obserwuj})')
-        ax_score.axvline(100, color='gray', linewidth=0.8, linestyle='-', alpha=0.3)
+        scores = df_plot["SCORE"].tolist()
+        for i, sc in enumerate(scores):
+            ax_s.text(min(sc + 1, 98), i, f"{sc} pkt",
+                      va='center', fontsize=8, fontweight='bold',
+                      color='white' if sc > 60 else 'black')
 
-        # Etykiety z łącznym score
-        for i, r in enumerate(df_plot.itertuples()):
-            total = r._score_raw if hasattr(r, '_score_raw') else 0
-            ax_score.text(min(total + 1.5, 98), i, f"{int(total)} pkt",
-                         va='center', ha='left', fontsize=8, color='white' if total > 50 else 'black',
-                         fontweight='bold')
-
-        ax_score.set_xlim(0, 105)
-        ax_score.set_xlabel("Score (0–100 pkt)")
-        ax_score.set_title("Matryca Scoringowa — składowe punktacji na spółkę")
-        ax_score.legend(loc='lower right', fontsize=8)
-        ax_score.grid(True, alpha=0.2, axis='x')
+        ax_s.set_xlim(0, 105)
+        ax_s.set_xlabel("Score (0–100 pkt)")
+        ax_s.set_title("Matryca Scoringowa — składowe na spółkę")
+        ax_s.legend(loc='lower right', fontsize=8)
+        ax_s.grid(True, alpha=0.2, axis='x')
         plt.tight_layout()
-        st.pyplot(fig_score)
-        plt.close(fig_score)
+        st.pyplot(fig_s)
+        plt.close(fig_s)
     else:
-        st.info("Brak danych do wykresu.")
+        st.info("Wszystkie spółki poniżej SMA200 — brak danych do wykresu punktowego.")
 
     st.caption(
-        "**Legenda składowych:** 🔵 Trend SMA200 (30 pkt) | 🟢 RSI 50–70 (30 pkt) | "
-        "🟠 ROC10 momentum (30 pkt) | 🟣 Wolumen >1.2×śr. (10 pkt)\n\n"
-        "🟩 KUPUJ ≥ próg w Hossie | 🟡 CZEKAJ = Bessa | 🟥 SPADAJĄCY NÓŻ = Score 0 | "
-        "🟪 WYKUPIENIE = RSI > 75"
+        "**Składowe:** 🔵 Trend SMA200 (30) | 🟢 RSI 50–70 (30) | 🟠 ROC10 momentum (30) | 🟣 Wolumen >1.2× (10)\n\n"
+        "**Statusy:** 🟩 KUPUJ | 🟡 Bessa | 🟢 OBSERWUJ+ | ⚪ OBSERWUJ | "
+        "🔵 REAKCJA POPYTU | ⛔ UNIKAJ (TREND-) | 🟥 SPADAJĄCY NÓŻ | 🟪 WYKUPIENIE(TP)\n\n"
+        "**!W** = słabość trendu tygodniowego spółki mimo hossy na WIG"
     )
