@@ -897,11 +897,6 @@ with tab3:
         st.pyplot(fig2)
         plt.close(fig2)
         st.caption(f"Pionowe linie = dni zakupów DCA ({len(dca_zakupy)} transakcji)")
-
-# =====================================================================
-# TAB 4 — HYBRYDOWY SYSTEM SCORINGOWY
-# =====================================================================
-
 # =====================================================================
 # TAB 4 — HYBRYDOWY SYSTEM SCORINGOWY v2
 # =====================================================================
@@ -951,9 +946,9 @@ with tab4:
     )
     scoring_period = {"6M": "6mo", "1Y": "1y", "2Y": "2y"}[scoring_okres]
 
-    prog_kupuj   = st.sidebar.slider("Próg KUPUJ (pkt)",    30, 80, 40,
+    prog_kupuj   = st.sidebar.slider("Próg KUPUJ (pkt)",    30, 90, 60,
                                      help="Score ≥ ta wartość → sygnał KUPUJ w hossie")
-    prog_obserwuj = st.sidebar.slider("Próg OBSERWUJ+ (pkt)", 15, 60, 25,
+    prog_obserwuj = st.sidebar.slider("Próg OBSERWUJ+ (pkt)", 15, 70, 45,
                                       help="Score ≥ ta wartość → OBSERWUJ+")
     sl_pct = st.sidebar.number_input("Stop Loss (%)",   value=6.0,  min_value=1.0, max_value=20.0, step=0.5) / 100
     tp_pct = st.sidebar.number_input("Take Profit (%)", value=10.0, min_value=1.0, max_value=50.0, step=0.5) / 100
@@ -983,57 +978,113 @@ with tab4:
 
     def oblicz_score_hybryd(df: pd.DataFrame) -> dict | None:
         """
-        Model punktowy 0–100:
-          Trend SMA200     30 pkt  (cena > SMA200)
-          RSI strefa       30 pkt  (50–70 = 30 | 40–50 = 15)
-          ROC10 momentum   30 pkt  (>5% = 30 | >0% = 20)
-          Wolumen          10 pkt  (vol > 1.2 × avg20)
+        Model punktowy 0–100 — GRADIENTOWY (selektywny):
 
-        Overrides:
-          WYKUPIENIE    — RSI > 75 (niezależnie od score)
-          SPADAJĄCY NÓŻ — cena < SMA200 AND ROC10 < –5% → score = 0
-          UNIKAJ TREND- — cena < SMA200 AND ROC10 >= –5% → score = 0
-          REAKCJA POPYTU — score = 0, cena < SMA200, ROC10 w [–3%, +3%],
-                           vol_ratio > 1.5 (wyraźny popyt mimo słabości)
+        1. Trend SMA200         max 30 pkt — GRADIENTOWY odległością od SMA200
+             > +10%  = 30 pkt   (silny trend)
+             > +5%   = 20 pkt
+             > +2%   = 12 pkt
+             > 0%    =  6 pkt   (tuż nad SMA200 — słaby sygnał)
+             <= 0%   =  0 pkt
+
+        2. RSI strefa           max 30 pkt — wąskie okno, kara za skrajności
+             55–65  = 30 pkt   (idealna strefa rozpędu)
+             50–55  = 20 pkt
+             65–70  = 15 pkt   (dobry, ale zbliża się do wykupienia)
+             45–50  = 10 pkt
+             < 45 lub > 70 = 0 pkt
+
+        3. ROC10 momentum       max 30 pkt — GRADIENTOWY, wymaga siły
+             > +8%  = 30 pkt   (bardzo silne momentum)
+             > +5%  = 22 pkt
+             > +2%  = 14 pkt
+             > 0%   =  6 pkt   (ledwo dodatni — mały bonus)
+             <= 0%  =  0 pkt
+
+        4. Wolumen              max 10 pkt — GRADIENTOWY
+             > 2.0x = 10 pkt   (bardzo wysoki — potwierdzenie)
+             > 1.5x =  7 pkt
+             > 1.2x =  4 pkt
+             <= 1.2x = 0 pkt
+
+        Wynik typowej "OK" spółki w hossie:
+          ponad SMA200 o 3%  → 12 pkt
+          RSI = 58           → 30 pkt
+          ROC10 = +1.5%      → 6 pkt
+          vol = 1.1x         → 0 pkt
+          SUMA = 48 pkt  → OBSERWUJ (nie KUPUJ od razu!)
+
+        KUPUJ (55 pkt) wymaga realnej siły w co najmniej 2-3 składnikach.
         """
         if df is None or len(df) < 25:
             return None
 
-        close  = df['Close']
-        volume = df['Volume']
+        close     = df['Close']
+        volume    = df['Volume']
 
-        sma200   = close.ewm(span=200, min_periods=min(200, len(close))).mean()
-        rsi      = oblicz_rsi(close, 14)
-        roc10    = (close / close.shift(10) - 1) * 100
+        sma200    = close.ewm(span=200, min_periods=min(200, len(close))).mean()
+        sma50     = close.rolling(window=min(50, len(close))).mean()
+        rsi       = oblicz_rsi(close, 14)
+        roc10     = (close / close.shift(10) - 1) * 100
         vol_avg20 = volume.rolling(20).mean()
 
-        last_close   = float(close.iloc[-1])
-        last_sma200  = float(sma200.iloc[-1])
-        last_rsi     = float(rsi.iloc[-1])
-        last_roc10   = float(roc10.iloc[-1]) if pd.notna(roc10.iloc[-1]) else 0.0
-        last_vol     = float(volume.iloc[-1])
-        last_volavg  = float(vol_avg20.iloc[-1]) if pd.notna(vol_avg20.iloc[-1]) else 0.0
-        vol_ratio    = (last_vol / last_volavg) if last_volavg > 0 else 0.0
+        last_close  = float(close.iloc[-1])
+        last_sma200 = float(sma200.iloc[-1])
+        last_sma50  = float(sma50.iloc[-1]) if pd.notna(sma50.iloc[-1]) else last_sma200
+        last_rsi    = float(rsi.iloc[-1])
+        last_roc10  = float(roc10.iloc[-1]) if pd.notna(roc10.iloc[-1]) else 0.0
+        last_vol    = float(volume.iloc[-1])
+        last_volavg = float(vol_avg20.iloc[-1]) if pd.notna(vol_avg20.iloc[-1]) else 0.0
+        vol_ratio   = (last_vol / last_volavg) if last_volavg > 0 else 0.0
         ponad_sma200 = last_close > last_sma200
 
-        # ── Składniki ────────────────────────────────────────────────
-        trend_pts = 30 if ponad_sma200 else 0
-
-        if 50 <= last_rsi <= 70:
-            rsi_pts = 30
-        elif 40 <= last_rsi < 50:
-            rsi_pts = 15
+        # ── 1. Trend SMA200 — gradientowy (max 30 pkt) ───────────────
+        if ponad_sma200:
+            dystans_pct = (last_close / last_sma200 - 1) * 100
+            if dystans_pct > 10:
+                trend_pts = 30
+            elif dystans_pct > 5:
+                trend_pts = 20
+            elif dystans_pct > 2:
+                trend_pts = 12
+            else:
+                trend_pts = 6   # tuż nad SMA200 — niepewna pozycja
         else:
-            rsi_pts = 0
+            trend_pts = 0
 
-        if last_roc10 > 5:
+        # ── 2. RSI — wąska strefa optymalności (max 30 pkt) ──────────
+        if 55 <= last_rsi <= 65:
+            rsi_pts = 30   # idealna strefa
+        elif 50 <= last_rsi < 55:
+            rsi_pts = 20
+        elif 65 < last_rsi <= 70:
+            rsi_pts = 15   # dobre, ale zbliża się do wykupienia
+        elif 45 <= last_rsi < 50:
+            rsi_pts = 10
+        else:
+            rsi_pts = 0    # RSI < 45 lub > 70 = brak premii
+
+        # ── 3. ROC10 — wymaga realnego momentum (max 30 pkt) ─────────
+        if last_roc10 > 8:
             roc_pts = 30
+        elif last_roc10 > 5:
+            roc_pts = 22
+        elif last_roc10 > 2:
+            roc_pts = 14
         elif last_roc10 > 0:
-            roc_pts = 20
+            roc_pts = 6    # ledwo dodatni — minimalny bonus
         else:
             roc_pts = 0
 
-        vol_pts = 10 if vol_ratio > 1.2 else 0
+        # ── 4. Wolumen — gradientowy (max 10 pkt) ────────────────────
+        if vol_ratio > 2.0:
+            vol_pts = 10
+        elif vol_ratio > 1.5:
+            vol_pts = 7
+        elif vol_ratio > 1.2:
+            vol_pts = 4
+        else:
+            vol_pts = 0
 
         score = trend_pts + rsi_pts + roc_pts + vol_pts
 
@@ -1391,3 +1442,5 @@ with tab4:
         "🔵 REAKCJA POPYTU | ⛔ UNIKAJ (TREND-) | 🟥 SPADAJĄCY NÓŻ | 🟪 WYKUPIENIE(TP)\n\n"
         "**!W** = słabość trendu tygodniowego spółki mimo hossy na WIG"
     )
+
+    
