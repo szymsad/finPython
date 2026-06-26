@@ -68,6 +68,7 @@ def pobierz_dane_fundamentalne(ticker: str) -> dict:
             "market_cap":        get("marketCap"),
             "pe":                get("trailingPE"),
             "pb":                get("priceToBook"),
+            "ps":                get("priceToSalesTrailing12Months"),
             "div_yield":         div_yield,
             "roe":               get("returnOnEquity", 100),   # jako %
             "roa":               get("returnOnAssets", 100),   # jako %
@@ -82,7 +83,7 @@ def pobierz_dane_fundamentalne(ticker: str) -> dict:
         }
     except Exception as e:
         return {k: None for k in [
-            "ticker","nazwa","kurs","market_cap","pe","pb","div_yield",
+            "ticker","nazwa","kurs","market_cap","pe","pb","ps","div_yield",
             "roe","roa","de_ratio","ev_ebitda","wzrost_eps","wzrost_przychodow",
             "beta","trailing_eps","forward_eps"
         ]} | {"ticker": ticker, "nazwa": ticker, "blad": str(e)}
@@ -130,6 +131,7 @@ def oblicz_scoring(dane: dict, cfg: dict) -> dict:
 
     wyniki["pe"]                = punktuj("pe",                odwrocony=True)
     wyniki["pb"]                = punktuj("pb",                odwrocony=True)
+    wyniki["ps"]                = punktuj("ps",                odwrocony=True)
     wyniki["div_yield"]         = punktuj("div_yield",         odwrocony=False)
     wyniki["roe"]               = punktuj("roe",               odwrocony=False)
     wyniki["roa"]               = punktuj("roa",               odwrocony=False)
@@ -152,94 +154,97 @@ def oblicz_scoring(dane: dict, cfg: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# DOMYŚLNA KONFIGURACJA SCORINGU
+# PRESETY KONFIGURACJI SCORINGU
 # ---------------------------------------------------------------------------
 
+# Metadane wskaźników — niezmienne między presetami
+_WSKAZNIKI_META = {
+    "pe":                {"label": "C/Z (P/E)",              "jednostka": "x", "help": "Cena / Zysk. Niższe = taniej. Dla banków GPW typowo 8–15x."},
+    "pb":                {"label": "C/WK (P/BV)",            "jednostka": "x", "help": "Cena / Wartość Księgowa. <1 = spółka tańsza niż aktywa netto."},
+    "ps":                {"label": "C/S (P/S)",              "jednostka": "x", "help": "Cena / Przychody. Niższe = taniej. Spółki GPW typowo 0.5–3x. Odporne na manipulacje zyskiem."},
+    "div_yield":         {"label": "Dywidenda (yield)",      "jednostka": "%", "help": "Roczna dywidenda / kurs. Wyższe = lepiej."},
+    "roe":               {"label": "ROE",                    "jednostka": "%", "help": "Zwrot z kapitału własnego. Dla banków GPW norma 10–18%."},
+    "roa":               {"label": "ROA",                    "jednostka": "%", "help": "Zwrot z aktywów. Banki mają strukturalnie niskie ROA (0.5–1.5%)."},
+    "de_ratio":          {"label": "Dług/Kapitał (D/E)",     "jednostka": "x", "help": "Zadłużenie / Kapitał własny. UWAGA: dla banków strukturalnie wysoki i mylący."},
+    "ev_ebitda":         {"label": "EV/EBITDA",              "jednostka": "x", "help": "Enterprise Value / EBITDA. Niższe = tańsza wycena."},
+    "wzrost_eps":        {"label": "Wzrost EPS (r/r)",       "jednostka": "%", "help": "Prognozowany wzrost zysku na akcję (trailing → forward EPS)."},
+    "wzrost_przychodow": {"label": "Wzrost przychodów (r/r)", "jednostka": "%", "help": "Roczny wzrost przychodów (Revenue Growth)."},
+}
+
+# Dane presetów: (aktywny, waga, prog_max, prog_min)
+# prog_max = wartość dająca 100 pkt, prog_min = wartość dająca 0 pkt
+_PRESETY = {
+    "🏦 Banki GPW (dywidenda + wartość)": {
+        "opis": "Profil konserwatywny. Premiuje niską wycenę (P/E, P/BV), wysoką dywidendę "
+                "i solidne ROE. Skrojony pod polskie banki w IKZE. P/S wyłączony — dla banków "
+                "wskaźnik przychodów jest nieporównywalny z innymi sektorami.",
+        "pe":                (True,  15,  8.0,  25.0),
+        "pb":                (True,  15,  0.8,   2.5),
+        "ps":                (False,  0,  1.0,   5.0),  # wyłączony dla banków
+        "div_yield":         (True,  15,  7.0,   0.0),
+        "roe":               (True,  15, 20.0,   5.0),
+        "roa":               (False,  5,  2.0,   0.3),
+        "de_ratio":          (False, 10,  0.5,   5.0),
+        "ev_ebitda":         (True,  15,  5.0,  20.0),
+        "wzrost_eps":        (True,  10, 20.0, -10.0),
+        "wzrost_przychodow": (True,  15, 15.0,  -5.0),
+    },
+    "🚀 Wzrost agresywny GPW (2–3 lata)": {
+        "opis": "Profil ofensywny. Maksymalnie premiuje dynamikę wzrostu przychodów i EPS oraz "
+                "wysokie ROE. Wycena (P/E, P/BV) ma mniejsze znaczenie — spółki wzrostowe "
+                "zawsze wyglądają drogo. Dywidenda i D/E wyłączone — spółka wzrostowa reinwestuje "
+                "zyski zamiast je wypłacać. EV/EBITDA i P/S jako miękka korekta przepłacenia.",
+        "pe":                (True,  10, 15.0,  60.0),
+        "pb":                (False,  0,  1.0,   8.0),
+        "ps":                (True,  10,  2.0,  15.0),  # miękka kontrola przepłacenia
+        "div_yield":         (False,  0,  3.0,   0.0),
+        "roe":               (True,  25, 30.0,  10.0),
+        "roa":               (True,  10,  8.0,   1.0),
+        "de_ratio":          (False,  0,  1.0,   5.0),
+        "ev_ebitda":         (True,  10,  8.0,  40.0),
+        "wzrost_eps":        (True,  20, 35.0,   0.0),
+        "wzrost_przychodow": (True,  25, 25.0,   0.0),
+    },
+    "💎 Jakość (Dividend Growth + Compounders)": {
+        "opis": "Profil jakościowy. Szuka spółek z rosnącą dywidendą, solidnym i przyspieszającym "
+                "wzrostem EPS, atrakcyjnym EV/EBITDA i niskim P/S (płacisz mało za każdą złotówkę "
+                "przychodów). P/E powiązane ze wzrostem — wyższe C/Z akceptowane gdy EPS szybko rośnie. "
+                "Cel: compounders GPW które rosną i dzielą się zyskiem jednocześnie.",
+        "pe":                (True,  15, 10.0,  30.0),  # umiarkowane — jakość ma swoją cenę
+        "pb":                (False,  0,  1.0,   4.0),  # wyłączone — P/S lepszy dla tej strategii
+        "ps":                (True,  20,  0.8,   6.0),  # główny wskaźnik wyceny przychód. ≤0.8→ 100pkt
+        "div_yield":         (True,  15,  5.0,   0.0),  # liczy się ale nie dominuje
+        "roe":               (True,  20, 22.0,   8.0),  # wysoka jakość kapitału
+        "roa":               (False,  0,  5.0,   0.5),
+        "de_ratio":          (True,  10,  0.5,   3.0),  # włączony — compounders mają niski dług
+        "ev_ebitda":         (True,  15,  6.0,  20.0),  # ważny dla wyceny jakości
+        "wzrost_eps":        (True,  25, 20.0,  -5.0),  # kluczowy — EPS musi rosnąć
+        "wzrost_przychodow": (False,  0, 15.0,  -5.0),  # wyłączony — EPS ważniejszy niż przychody
+    },
+}
+
+NAZWY_PRESETOW = list(_PRESETY.keys())
+
+
+def konfiguracja_z_presetu(nazwa_presetu: str) -> dict:
+    """Buduje pełny słownik konfiguracji z wybranego presetu."""
+    preset = _PRESETY[nazwa_presetu]
+    cfg = {}
+    for klucz, meta in _WSKAZNIKI_META.items():
+        aktywny, waga, prog_max, prog_min = preset[klucz]
+        cfg[klucz] = {
+            **meta,
+            "aktywny":  aktywny,
+            "waga":     waga,
+            "prog_max": prog_max,
+            "prog_min": prog_min,
+        }
+    return cfg
+
+
 def domyslna_konfiguracja() -> dict:
-    """Zwraca domyślną konfigurację scoringu dostosowaną do banków GPW."""
-    return {
-        "pe": {
-            "label":    "C/Z (P/E)",
-            "aktywny":  True,
-            "waga":     15,
-            "prog_max": 8,    # ≤8 → 100 pkt  (banki GPW: niskie P/E norma)
-            "prog_min": 25,   # ≥25 → 0 pkt
-            "jednostka": "x",
-            "help":     "Cena / Zysk. Niższe = taniej. Dla banków GPW typowo 8–15x.",
-        },
-        "pb": {
-            "label":    "C/WK (P/BV)",
-            "aktywny":  True,
-            "waga":     15,
-            "prog_max": 0.8,  # ≤0.8 → 100 pkt  (poniżej wartości księgowej)
-            "prog_min": 2.5,  # ≥2.5 → 0 pkt
-            "jednostka": "x",
-            "help":     "Cena / Wartość Księgowa. <1 = spółka tańsza niż aktywa netto.",
-        },
-        "div_yield": {
-            "label":    "Dywidenda (yield)",
-            "aktywny":  True,
-            "waga":     15,
-            "prog_max": 7.0,  # ≥7% → 100 pkt
-            "prog_min": 0.0,  # 0% → 0 pkt
-            "jednostka": "%",
-            "help":     "Roczna dywidenda / kurs. Wyższe = lepiej.",
-        },
-        "roe": {
-            "label":    "ROE",
-            "aktywny":  True,
-            "waga":     15,
-            "prog_max": 20.0, # ≥20% → 100 pkt
-            "prog_min": 5.0,  # ≤5% → 0 pkt
-            "jednostka": "%",
-            "help":     "Zwrot z kapitału własnego. Dla banków GPW norma 10–18%.",
-        },
-        "roa": {
-            "label":    "ROA",
-            "aktywny":  False,
-            "waga":     5,
-            "prog_max": 2.0,  # ≥2% → 100 pkt
-            "prog_min": 0.3,  # ≤0.3% → 0 pkt
-            "jednostka": "%",
-            "help":     "Zwrot z aktywów. Banki mają strukturalnie niskie ROA (0.5–1.5%).",
-        },
-        "de_ratio": {
-            "label":    "Dług/Kapitał (D/E)",
-            "aktywny":  False,   # domyślnie wyłączony — banki mają wysoki D/E ze swej natury
-            "waga":     10,
-            "prog_max": 0.5,  # ≤0.5 → 100 pkt
-            "prog_min": 5.0,  # ≥5 → 0 pkt
-            "jednostka": "x",
-            "help":     "Zadłużenie / Kapitał własny. UWAGA: dla banków ten wskaźnik jest strukturalnie wysoki i może być mylący.",
-        },
-        "ev_ebitda": {
-            "label":    "EV/EBITDA",
-            "aktywny":  True,
-            "waga":     15,
-            "prog_max": 5.0,  # ≤5 → 100 pkt
-            "prog_min": 20.0, # ≥20 → 0 pkt
-            "jednostka": "x",
-            "help":     "Enterprise Value / EBITDA. Niższe = tańsza wycena.",
-        },
-        "wzrost_eps": {
-            "label":    "Wzrost EPS (r/r)",
-            "aktywny":  True,
-            "waga":     10,
-            "prog_max": 20.0, # ≥20% → 100 pkt
-            "prog_min": -10.0,# ≤-10% → 0 pkt
-            "jednostka": "%",
-            "help":     "Prognozowany wzrost zysku na akcję (trailing → forward EPS).",
-        },
-        "wzrost_przychodow": {
-            "label":    "Wzrost przychodów (r/r)",
-            "aktywny":  True,
-            "waga":     15,
-            "prog_max": 15.0, # ≥15% → 100 pkt
-            "prog_min": -5.0, # ≤-5% → 0 pkt
-            "jednostka": "%",
-            "help":     "Roczny wzrost przychodów (Revenue Growth).",
-        },
-    }
+    """Zwraca konfigurację domyślnego presetu (banki GPW)."""
+    return konfiguracja_z_presetu(NAZWY_PRESETOW[0])
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +252,50 @@ def domyslna_konfiguracja() -> dict:
 # ---------------------------------------------------------------------------
 
 PORADNIKI = {
+    "ps": """
+**Co to jest?**
+C/S (Cena do Przychodów, ang. P/S — Price to Sales) porównuje kapitalizację rynkową spółki
+do jej rocznych przychodów ze sprzedaży. Mówi ile złotych płacisz za każdą złotówkę przychodu.
+**Wzór:** P/S = Kapitalizacja rynkowa / Roczne przychody
+
+**Jak interpretować?**
+- **P/S = 0.5** → płacisz 50 gr za każdą złotówkę przychodów. Bardzo atrakcyjne.
+- **P/S = 1.0** → kapitalizacja równa rocznemu przychodowi. Umiarkowana wycena.
+- **P/S = 5.0** → płacisz 5 zł za 1 zł przychodu. Wysokie oczekiwania wzrostu.
+- **P/S > 10** → wycena typowa dla spółek SaaS/tech z bardzo wysoką marżą lub silnym wzrostem.
+
+**Dlaczego P/S bywa lepszy od P/E?**
+P/E wymaga zysku netto — spółka ze stratą ma ujemne lub niedostępne P/E.
+P/S działa zawsze, nawet gdy spółka jest na etapie wzrostu i reinwestuje wszystko.
+Przychody są też trudniejsze do zmanipulowania niż zysk netto (który zależy od polityki
+amortyzacji, rezerw, jednorazowych zdarzeń). P/S ujawnia prawdziwą skalę biznesu.
+
+**Typowe wartości dla GPW (szerokie WIG):**
+- **Handel detaliczny** (LPP, CCC, Dino): P/S 0.3–1.5× (niskie marże → niskie P/S)
+- **Przemysł / produkcja** (KGHM, Stalprodukt): P/S 0.4–2×
+- **IT / technologia** (Asseco, Comarch, XTB): P/S 1–5×
+- **Deweloperzy** (Dom Development, Develia): P/S 1–3×
+- **Banki**: P/S jest tu mylący — "przychody" banku to marża odsetkowa, nie sprzedaż produktów.
+  Dlatego w presecie bankowym P/S jest wyłączony.
+
+**Związek P/S z marżą netto:**
+P/S i marża netto razem mówią wszystko. Spółka z P/S = 2× i marżą 20% ma P/E = 10× — tanio.
+Spółka z P/S = 2× i marżą 2% ma P/E = 100× — drogo. Wzór: P/E ≈ P/S / marża netto.
+Wysoki P/S jest uzasadniony tylko przy wysokiej marży lub perspektywie jej szybkiego wzrostu.
+
+**Na co uważać — pułapki:**
+- **Sektor ma znaczenie**: P/S = 3× to drogo dla producenta stali, a tanio dla firmy software.
+  Nigdy nie porównuj P/S między różnymi branżami.
+- **Wzrost przychodów bez zysku**: niska marża + wysoki P/S = zakład na przyszłość. Ryzykowne.
+- **Jednorazowe przychody**: sprzedaż nieruchomości, projektu — zawyżają mianownik, zaniżają P/S.
+  Sprawdź czy przychody są powtarzalne.
+
+**Kiedy warto podnieść wagę?**
+P/S świetnie sprawdza się w presetach jakościowych i wzrostowych, szczególnie dla spółek
+IT, handlu detalicznego i produkcji — wszędzie tam gdzie marże są przewidywalne.
+Dla banków i ubezpieczycieli P/S wyłącz — używaj P/BV i ROE zamiast tego.
+""",
+
     "pe": """
 **Co to jest?**
 C/Z (Cena do Zysku, ang. P/E — Price to Earnings) to stosunek aktualnej ceny akcji do zysku netto
@@ -590,7 +639,36 @@ organicznie, a nie tylko przez cięcia kosztów. Para: wzrost przychodów + ROE 
 def render_konfiguracja(cfg: dict) -> dict:
     """Renderuje expander z ustawieniami scoringu. Zwraca zaktualizowaną konfigurację."""
     with st.expander("⚙️ Konfiguracja systemu scoringowego", expanded=False):
-        st.markdown("Ustaw **wagi** i **progi** dla każdego wskaźnika. Wagi nie muszą sumować się do 100% — są normalizowane automatycznie.")
+
+        # ── Selektor presetów ────────────────────────────────────────────────
+        st.markdown("### 🎯 Profil inwestycyjny")
+
+        # Zapamiętaj aktualny preset w session_state
+        if "fund_preset" not in st.session_state:
+            st.session_state["fund_preset"] = NAZWY_PRESETOW[0]
+
+        wybrany_preset = st.radio(
+            "Wybierz profil scoringowy:",
+            options=NAZWY_PRESETOW,
+            index=NAZWY_PRESETOW.index(st.session_state["fund_preset"]),
+            key="fund_preset_radio",
+            horizontal=False,
+        )
+
+        # Opis wybranego presetu
+        st.info(_PRESETY[wybrany_preset]["opis"])
+
+        # Przycisk ładowania presetu — podmienia cfg
+        if st.button("⚡ Załaduj ten profil (nadpisuje poniższe ustawienia)", key="fund_load_preset"):
+            cfg = konfiguracja_z_presetu(wybrany_preset)
+            st.session_state["fund_cfg"] = cfg
+            st.session_state["fund_preset"] = wybrany_preset
+            st.success(f"Załadowano profil: **{wybrany_preset}**")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("**Dostosuj szczegółowo** (zmiany są niezależne od presetu po załadowaniu):")
+        st.caption("Wagi nie muszą sumować się do 100% — są normalizowane automatycznie.")
         st.markdown("---")
 
         for klucz, ustawienia in cfg.items():
@@ -610,7 +688,7 @@ def render_konfiguracja(cfg: dict) -> dict:
 
             with col_waga:
                 cfg[klucz]["waga"] = st.number_input(
-                    "Waga", min_value=1, max_value=100,
+                    "Waga", min_value=0, max_value=100,
                     value=ustawienia["waga"], step=5,
                     key=f"fund_waga_{klucz}",
                     disabled=disabled,
@@ -705,48 +783,184 @@ def label_scoring(pkt) -> str:
 # GŁÓWNA FUNKCJA RENDEROWANIA
 # ---------------------------------------------------------------------------
 
+FUND_LIST_FILE = "fund_watchlist.txt"
+FUND_LIST_DEFAULT = "PKO.WA, MBK.WA, PEO.WA, ING.WA, EBP.WA"
+
+
+def _wczytaj_liste_fund() -> list[str]:
+    """Wczytuje własną listę fundamentalną z pliku lub zwraca domyślną."""
+    import os
+    if os.path.exists(FUND_LIST_FILE):
+        with open(FUND_LIST_FILE, "r") as f:
+            zawartosc = f.read().strip()
+        if zawartosc:
+            return [t.strip().upper() for t in zawartosc.split(",") if t.strip()]
+    return [t.strip().upper() for t in FUND_LIST_DEFAULT.split(",") if t.strip()]
+
+
+def _zapisz_liste_fund(tickers: list[str]) -> None:
+    """Zapisuje listę fundamentalną do pliku."""
+    with open(FUND_LIST_FILE, "w") as f:
+        f.write(", ".join(tickers))
+
+
 def render(params):
     st.header("🔬 Analiza Fundamentalna — System Scoringowy")
 
-    # Inicjalizacja konfiguracji w session_state
+    # Inicjalizacja konfiguracji scoringu w session_state
     if "fund_cfg" not in st.session_state:
         st.session_state["fund_cfg"] = domyslna_konfiguracja()
 
     cfg = render_konfiguracja(st.session_state["fund_cfg"])
     st.session_state["fund_cfg"] = cfg
 
-    watchlist = params["watchlist"]
+    st.divider()
+
+    # -----------------------------------------------------------------------
+    # SEKCJA 0 — Zarządzanie własną listą fundamentalną
+    # -----------------------------------------------------------------------
+    st.subheader("📋 Lista spółek do analizy fundamentalnej")
+
+    # Inicjalizacja listy w session_state
+    if "fund_lista" not in st.session_state:
+        st.session_state["fund_lista"] = _wczytaj_liste_fund()
+
+    lista_fund = st.session_state["fund_lista"]
+    watchlist_globalna = params["watchlist"]
+
+    col_lista, col_zarzadzaj = st.columns([3, 2])
+
+    with col_lista:
+        # Wyświetl aktualną listę jako edytowalny text_area
+        lista_str = st.text_area(
+            "Spółki na liście fundamentalnej (oddzielone przecinkami):",
+            value=", ".join(lista_fund),
+            height=80,
+            key="fund_lista_input",
+            help="Wpisz tickery GPW z sufiksem .WA, np. PKO.WA, XTB.WA, LPP.WA",
+        )
+        col_save, col_reset = st.columns(2)
+        with col_save:
+            if st.button("💾 Zapisz listę", key="fund_zapisz"):
+                nowe = [t.strip().upper() for t in lista_str.split(",") if t.strip()]
+                if nowe:
+                    st.session_state["fund_lista"] = nowe
+                    _zapisz_liste_fund(nowe)
+                    st.success(f"Zapisano {len(nowe)} spółek.")
+                    st.rerun()
+                else:
+                    st.error("Lista nie może być pusta.")
+        with col_reset:
+            if st.button("↩️ Przywróć domyślne", key="fund_reset"):
+                domyslne = [t.strip().upper() for t in FUND_LIST_DEFAULT.split(",") if t.strip()]
+                st.session_state["fund_lista"] = domyslne
+                _zapisz_liste_fund(domyslne)
+                st.rerun()
+
+    with col_zarzadzaj:
+        st.markdown("**➕ Dodaj spółki z listy globalnej:**")
+        st.caption("Zaznacz spółki z głównej watchlisty aby dodać je do listy fundamentalnej.")
+        do_dodania = []
+        for t in watchlist_globalna:
+            if t not in lista_fund:
+                if st.checkbox(f"+ {t}", key=f"fund_add_{t}"):
+                    do_dodania.append(t)
+        if do_dodania:
+            if st.button(f"➕ Dodaj zaznaczone ({len(do_dodania)})", key="fund_dodaj_btn"):
+                nowa_lista = lista_fund + [t for t in do_dodania if t not in lista_fund]
+                st.session_state["fund_lista"] = nowa_lista
+                _zapisz_liste_fund(nowa_lista)
+                st.rerun()
+        elif all(t in lista_fund for t in watchlist_globalna):
+            st.caption("✅ Wszystkie spółki z listy globalnej są już na liście fundamentalnej.")
 
     st.divider()
 
     # -----------------------------------------------------------------------
-    # SEKCJA 1 — Pobieranie danych
+    # SEKCJA 1 — Checklista: które spółki pobrać
+    # -----------------------------------------------------------------------
+    lista_fund = st.session_state["fund_lista"]  # odśwież po ewentualnych zmianach
+
+    st.subheader("☑️ Wybierz spółki do pobrania")
+
+    # Inicjalizacja checkboxów w session_state
+    if "fund_selected" not in st.session_state:
+        st.session_state["fund_selected"] = {t: True for t in lista_fund}
+
+    # Synchronizacja — nowe spółki domyślnie zaznaczone, usunięte — wyrzucone
+    for t in lista_fund:
+        if t not in st.session_state["fund_selected"]:
+            st.session_state["fund_selected"][t] = True
+    for t in list(st.session_state["fund_selected"].keys()):
+        if t not in lista_fund:
+            del st.session_state["fund_selected"][t]
+
+    col_sel_all, col_desel_all, _, col_refresh = st.columns([1, 1, 3, 1.5])
+    with col_sel_all:
+        if st.button("☑️ Zaznacz wszystkie", key="fund_sel_all"):
+            for t in lista_fund:
+                st.session_state["fund_selected"][t] = True
+            st.rerun()
+    with col_desel_all:
+        if st.button("☐ Odznacz wszystkie", key="fund_desel_all"):
+            for t in lista_fund:
+                st.session_state["fund_selected"][t] = False
+            st.rerun()
+    with col_refresh:
+        if st.button("🔄 Wyczyść cache", key="fund_refresh"):
+            pobierz_dane_fundamentalne.clear()
+            st.rerun()
+
+    # Checkboxy w siatce — max 5 per wiersz
+    COLS_PER_ROW = 5
+    rows = [lista_fund[i:i+COLS_PER_ROW] for i in range(0, len(lista_fund), COLS_PER_ROW)]
+    for row in rows:
+        cols = st.columns(COLS_PER_ROW)
+        for col, t in zip(cols, row):
+            with col:
+                st.session_state["fund_selected"][t] = st.checkbox(
+                    t,
+                    value=st.session_state["fund_selected"].get(t, True),
+                    key=f"fund_chk_{t}",
+                )
+
+    wybrane = [t for t in lista_fund if st.session_state["fund_selected"].get(t, True)]
+
+    if not wybrane:
+        st.warning("⚠️ Zaznacz co najmniej jedną spółkę.")
+        return
+
+    st.caption(f"Do pobrania: **{len(wybrane)}** spółek — {', '.join(wybrane)}")
+
+    st.divider()
+
+    # -----------------------------------------------------------------------
+    # SEKCJA 2 — Pobieranie danych
     # -----------------------------------------------------------------------
     st.subheader("📡 Pobieranie danych fundamentalnych")
-
-    if st.button("🔄 Odśwież dane (wyczyść cache)", key="fund_refresh"):
-        pobierz_dane_fundamentalne.clear()
-        st.rerun()
 
     dane_wszystkich = {}
     scoring_wszystkich = {}
     bledy = []
 
-    with st.spinner(f"Pobieranie danych dla {len(watchlist)} spółek..."):
+    with st.spinner(f"Pobieranie danych dla {len(wybrane)} spółek..."):
         progress = st.progress(0)
-        for i, ticker in enumerate(watchlist):
+        for i, ticker in enumerate(wybrane):
             dane = pobierz_dane_fundamentalne(ticker)
             dane_wszystkich[ticker] = dane
             scoring_wszystkich[ticker] = oblicz_scoring(dane, cfg)
             if dane.get("blad"):
                 bledy.append(f"{ticker}: {dane['blad']}")
-            progress.progress((i + 1) / len(watchlist))
+            progress.progress((i + 1) / len(wybrane))
         progress.empty()
 
     if bledy:
         with st.expander(f"⚠️ Błędy pobierania ({len(bledy)} spółek)", expanded=False):
             for b in bledy:
                 st.warning(b)
+
+    # zastąp watchlist → wybrane dla dalszych sekcji
+    watchlist = wybrane
 
     # -----------------------------------------------------------------------
     # SEKCJA 2 — Tabela zbiorcza z rankingiem
@@ -771,6 +985,7 @@ def render(params):
             "Kurs (zł)":         f"{dane['kurs']:.2f}" if dane.get("kurs") else "—",
             "C/Z (P/E)":         fmt(dane.get("pe"), "x", 1),
             "C/WK (P/BV)":       fmt(dane.get("pb"), "x", 2),
+            "C/S (P/S)":         fmt(dane.get("ps"), "x", 2),
             "Dywidenda":         fmt(dane.get("div_yield"), "%", 1),
             "ROE":               fmt(dane.get("roe"), "%", 1),
             "ROA":               fmt(dane.get("roa"), "%", 1),
@@ -887,6 +1102,7 @@ def render(params):
                 show_metric("Market Cap",          dane.get("market_cap"),        "mld zł")
                 show_metric("C/Z trailing (P/E)",  dane.get("pe"),                "x")
                 show_metric("C/WK (P/BV)",         dane.get("pb"),                "x")
+                show_metric("C/S (P/S)",           dane.get("ps"),                "x")
                 show_metric("EV/EBITDA",           dane.get("ev_ebitda"),         "x")
                 show_metric("Dywidenda yield",     dane.get("div_yield"),         "%")
                 show_metric("ROE",                 dane.get("roe"),               "%")
