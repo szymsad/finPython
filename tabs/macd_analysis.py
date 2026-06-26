@@ -476,8 +476,8 @@ def render(params: dict):
             wklad_t = params["saldo_poczatkowe"] + w["suma_doplat"]
 
         zysk_t = wartość_t - wklad_t
-        roi_t  = (zysk_t / wklad_t * 100) if wklad_t > 0 else 0
-        bh_t   = (ost_cena_t / poczatkowa_t - 1) * 100
+        roi_t = (zysk_t / wklad_t * 100) if wklad_t > 0 else 0
+        bh_t = (ost_cena_t / poczatkowa_t - 1) * 100
 
         l_kup  = sum(1 for x in w["historia"] if x["typ"] == "KUP")
         l_spr  = sum(1 for x in w["historia"] if x["typ"] == "SPRZEDAJ")
@@ -506,7 +506,7 @@ def render(params: dict):
     st.subheader("🔍 Szczegóły per spółka")
     for t, w in wyniki.items():
         with st.expander(f"📌 {t} — szczegóły backtestowe"):
-            raw_t      = w["raw"]
+            raw_t= w["raw"]
             ost_cena_t = raw_t["Close"].iloc[-1]
             wartość_t  = w["saldo"] + w["amount"] * ost_cena_t
 
