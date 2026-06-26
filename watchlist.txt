@@ -1,1 +1,1 @@
-PKN.WA, DNP.WA, ETFBNDXPL.WA, ETFBSPXPL.WA, XTB.WA, KOM.WA, LBW.WA, EBP.WA, PKO.WA, mbk.wa, peo.wa, ing.wa
+PKN.WA, DNP.WA, XTB.WA,  EBP.WA, PKO.WA, mbk.wa, peo.wa, ing.wa

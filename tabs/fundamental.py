@@ -36,8 +36,25 @@ def pobierz_dane_fundamentalne(ticker: str) -> dict:
 
         wzrost_przychodow = get("revenueGrowth", 100)  # jako %
 
-        # Dywidenda
-        div_yield = get("dividendYield", 100)  # jako %
+        # Dywidenda — yfinance jest niespójny dla GPW:
+        # czasem zwraca ułamek (0.059), czasem procent (5.9), czasem kwotę dywidendy w PLN.
+        # Najbezpieczniej: liczymy yield ręcznie z dividendRate / currentPrice.
+        # Fallback: dividendYield z sanity checkiem (odrzucamy wartości > 30%).
+        div_yield = None
+        current_price = get("currentPrice") or get("regularMarketPrice")
+        dividend_rate = get("dividendRate")   # roczna dywidenda w walucie spółki (PLN)
+        if dividend_rate and current_price and current_price > 0:
+            div_yield = dividend_rate / current_price * 100  # obliczamy sami — pewne
+        else:
+            raw_yield = get("dividendYield")   # surowa wartość bez mnożenia
+            if raw_yield is not None:
+                if raw_yield <= 1.0:
+                    # ułamek dziesiętny (typowe dla US): 0.059 → 5.9%
+                    div_yield = raw_yield * 100
+                elif raw_yield <= 30.0:
+                    # już w procentach (niespójność yfinance dla niektórych giełd)
+                    div_yield = raw_yield
+                # else: wartość > 30% to błąd danych — zostawiamy None
 
         # D/E — dla banków często brak lub bardzo wysoki (normalne)
         de_ratio = get("debtToEquity")
@@ -47,7 +64,7 @@ def pobierz_dane_fundamentalne(ticker: str) -> dict:
         return {
             "ticker":            ticker,
             "nazwa":             info.get("longName") or info.get("shortName") or ticker,
-            "kurs":              get("currentPrice") or get("regularMarketPrice"),
+            "kurs":              current_price,
             "market_cap":        get("marketCap"),
             "pe":                get("trailingPE"),
             "pb":                get("priceToBook"),
